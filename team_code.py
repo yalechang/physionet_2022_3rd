@@ -25,10 +25,11 @@ from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 from scipy.signal import decimate, butter, sosfilt
 
+from python_speech_features import mfcc
 import torch
 import torch.nn as nn
 
-from model import MultiTaskClassifier
+from model import MultiTaskClassifierWithMFCC
 
 from evaluate_model import compute_weighted_accuracy, compute_cost
 
@@ -54,6 +55,18 @@ num_layer_shared = 2
 num_kernels_shared = 20
 kernel_size_shared = 15
 
+# get MFCC features
+def get_mfcc_feature(x_list):
+    mfcc_list = []
+    for x in x_list:
+        mfcc_list.append(mfcc(x, samplerate=4000//downsample, numcep=10).flatten())
+    mfcc_list = np.array(mfcc_list)
+    return mfcc_list
+
+dim_mfcc = 1
+mfcc_feat_example = get_mfcc_feature(np.arange(seq_len)[None,:]/seq_len)
+len_mfcc = mfcc_feat_example.shape[1]
+
 dim_static = 5
 dim_embedding = 64
 
@@ -64,7 +77,7 @@ kernel_size_task = 3
 n_class_first_task = 2
 n_class_second_task = 2
 
-model_file_name = "murmur"+str(n_class_first_task)+"_outcome_model.pt"
+model_file_name = "murmur"+str(n_class_first_task)+"_outcome_model_with_mfcc.pt"
 print(model_file_name)
 
 # optimization
@@ -168,6 +181,18 @@ def train_challenge_model(data_folder, model_folder, verbose):
         multiple=multiple, normalize=normalize, recording_mean=recording_mean, recording_std=recording_std)
     print(x_train.shape, x_val.shape)
 
+    # for each signal, create mfcc features
+    mfcc_train = get_mfcc_feature(x_train)
+    mfcc_val = get_mfcc_feature(x_val)    
+
+    # normalize mfcc features
+    mfcc_mean, mfcc_std = mfcc_train.mean(axis=0),mfcc_train.std(axis=0)
+    # save normalization constant
+    np.save(os.path.join(model_folder, "mfcc_mean_std.npy"), \
+        np.vstack([mfcc_mean, mfcc_std]))
+    mfcc_train = (mfcc_train-mfcc_mean)/mfcc_std
+    mfcc_val = (mfcc_val-mfcc_mean)/mfcc_std
+
     # get static features
     x_static_mean,x_static_std = df_static_train[cols].mean(axis=0).values, \
         df_static_train[cols].std(axis=0).values
@@ -205,13 +230,13 @@ def train_challenge_model(data_folder, model_folder, verbose):
 
     # train a multi-task classifier
     if flag_mode == 'train':
-        train_single_model(x_train, x_val, x_static_train, x_static_val, \
+        train_single_model(x_train, x_val, mfcc_train, mfcc_val, x_static_train, x_static_val, \
             y_murmur_train, y_murmur_val,  y_outcome_train, y_outcome_val,\
             model_folder, model_file_name)
     
     # optimize the threshold of the trained model
     # initialize model in PyTorch
-    model = MultiTaskClassifier(dim_pcg=dim_pcg, seq_len=seq_len, 
+    model = MultiTaskClassifierWithMFCC(dim_pcg=dim_pcg, seq_len=seq_len, dim_mfcc=dim_mfcc, len_mfcc=len_mfcc,
         num_layer_shared=num_kernels_shared, num_kernels_shared=num_kernels_shared, kernel_size_shared=kernel_size_shared,
         dim_static=dim_static, dim_embedding=dim_embedding,
         num_layer_task=num_layer_task, num_kernels_task=num_kernels_task, kernel_size_task=kernel_size_task,
@@ -240,12 +265,15 @@ def train_challenge_model(data_folder, model_folder, verbose):
             idx_batch = range(idx*batchSize, min((idx+1)*batchSize, n_val))
             x_batch = torch.from_numpy(x_val[idx_batch].reshape((\
                 len(idx_batch),1,x_val.shape[1]))).float()
+            mfcc_batch = torch.from_numpy(mfcc_val[idx_batch].reshape((\
+                len(idx_batch),1,mfcc_val.shape[1]))).float()            
             x_static_batch = torch.from_numpy(x_static_val[idx_batch]).float()
             if flag_useCuda:
                 x_batch = x_batch.cuda()
+                mfcc_batch = mfcc_batch.cuda()
                 x_static_batch = x_static_batch.cuda()
 
-            outputs_first, outputs_second = model.forward(x_batch, x_static_batch)
+            outputs_first, outputs_second = model.forward(x_batch, mfcc_batch, x_static_batch)
             
             yval_prob_first.append(outputs_first.detach().cpu().numpy())
             yval_prob_second.append(outputs_second.detach().cpu().numpy())
@@ -337,7 +365,7 @@ def train_challenge_model(data_folder, model_folder, verbose):
         np.array([threshold_murmur_optimal, threshold_outcome_optimal]))    
        
 
-def train_single_model(x_train, x_val, x_static_train, x_static_val, \
+def train_single_model(x_train, x_val, mfcc_train, mfcc_val, x_static_train, x_static_val, \
     y_train_first_task, y_val_first_task, y_train_second_task, y_val_second_task,\
     model_folder, model_name):
     
@@ -359,7 +387,7 @@ def train_single_model(x_train, x_val, x_static_train, x_static_val, \
     pos_weight_second, neg_weight_second = count_second[0]/n_train, count_second[1]/n_train
 
 
-    model = MultiTaskClassifier(dim_pcg=dim_pcg, seq_len=seq_len, 
+    model = MultiTaskClassifierWithMFCC(dim_pcg=dim_pcg, seq_len=seq_len, dim_mfcc=dim_mfcc, len_mfcc=len_mfcc,
         num_layer_shared=num_kernels_shared, num_kernels_shared=num_kernels_shared, kernel_size_shared=kernel_size_shared,
         dim_static=dim_static, dim_embedding=dim_embedding,
         num_layer_task=num_layer_task, num_kernels_task=num_kernels_task, kernel_size_task=kernel_size_task,
@@ -383,7 +411,7 @@ def train_single_model(x_train, x_val, x_static_train, x_static_val, \
     print("="*75)
 
     # compute AUC on the validation set
-    def compute_AUC(x_val, x_static_val, y_val_first_task, y_val_second_task):
+    def compute_AUC(x_val, mfcc_val, x_static_val, y_val_first_task, y_val_second_task):
         n_val = x_val.shape[0]
         yval_prob_first = []
         yval_prob_second = []
@@ -396,12 +424,15 @@ def train_single_model(x_train, x_val, x_static_train, x_static_val, \
                 idx_batch = range(idx*batchSize, min((idx+1)*batchSize, n_val))
                 x_batch = torch.from_numpy(x_val[idx_batch].reshape((\
                     len(idx_batch),1,x_val.shape[1]))).float()
+                mfcc_batch = torch.from_numpy(mfcc_val[idx_batch].reshape((\
+                    len(idx_batch),1,mfcc_val.shape[1]))).float()
                 x_static_batch = torch.from_numpy(x_static_val[idx_batch]).float()
                 if flag_useCuda:
                     x_batch = x_batch.cuda()
+                    mfcc_batch = mfcc_batch.cuda()
                     x_static_batch = x_static_batch.cuda()
                     
-                outputs_first, outputs_second = model.forward(x_batch, x_static_batch)
+                outputs_first, outputs_second = model.forward(x_batch, mfcc_batch, x_static_batch)
                 
                 yval_prob_first.append(outputs_first.detach().cpu().numpy())
                 yval_prob_second.append(outputs_second.detach().cpu().numpy())
@@ -437,13 +468,16 @@ def train_single_model(x_train, x_val, x_static_train, x_static_val, \
             # input shape: (N, Channel_in, L)      
             x_batch = torch.from_numpy(x_train[idx_batch].reshape((\
                 len(idx_batch),1,x_train.shape[1]))).float()
+            mfcc_batch = torch.from_numpy(mfcc_train[idx_batch].reshape((\
+                len(idx_batch),1,mfcc_train.shape[1]))).float()
             x_static_batch = torch.from_numpy(x_static_train[idx_batch]).float()
             if flag_useCuda:
                 x_batch = x_batch.cuda()
+                mfcc_batch = mfcc_batch.cuda()
                 x_static_batch = x_static_batch.cuda()
 
             # output shape: (N, Class)
-            outputs_first,outputs_second = model.forward(x_batch, x_static_batch)
+            outputs_first,outputs_second = model.forward(x_batch, mfcc_batch, x_static_batch)
 
             # compute the loss function: murmur prediction
             if n_class_first_task == 2:
@@ -484,7 +518,7 @@ def train_single_model(x_train, x_val, x_static_train, x_static_val, \
         # validation phase
         model.eval()
 
-        auc_val_first, auc_val_second = compute_AUC(x_val, x_static_val, y_val_first_task, y_val_second_task) 
+        auc_val_first, auc_val_second = compute_AUC(x_val, mfcc_val, x_static_val, y_val_first_task, y_val_second_task) 
         loss_val = -1*(auc_val_first+auc_val_second)/2
 
         # auc_train = (auc_train_first+auc_train_second)/2
@@ -526,7 +560,7 @@ def load_challenge_model(model_folder, verbose):
     model_name = model_file_name
 
     # initialize model in PyTorch
-    model = MultiTaskClassifier(dim_pcg=dim_pcg, seq_len=seq_len, 
+    model = MultiTaskClassifierWithMFCC(dim_pcg=dim_pcg, seq_len=seq_len, dim_mfcc=dim_mfcc, len_mfcc=len_mfcc,
         num_layer_shared=num_kernels_shared, num_kernels_shared=num_kernels_shared, kernel_size_shared=kernel_size_shared,
         dim_static=dim_static, dim_embedding=dim_embedding,
         num_layer_task=num_layer_task, num_kernels_task=num_kernels_task, kernel_size_task=kernel_size_task,
@@ -557,6 +591,13 @@ def load_challenge_model(model_folder, verbose):
     result['static_mean'] = static_mean
     result['static_std'] = static_std
 
+    # load normalization constant of mfcc variables
+    mfcc_const_name = os.path.join(model_folder, "mfcc_mean_std.npy")
+    tmp = np.load(mfcc_const_name)
+    mfcc_mean,mfcc_std = tmp[0],tmp[1]
+    result['mfcc_mean'] = mfcc_mean
+    result['mfcc_std'] = mfcc_std
+
     # load optimal threshold
     threshold_name = os.path.join(model_folder, "optimal_threshold_murmur_outcome.npy")
     tmp = np.load(threshold_name)
@@ -574,6 +615,7 @@ def run_challenge_model(model, data, recordings, verbose):
     clf.eval()
     recording_mean,recording_std = model['recording_mean'],model['recording_std']
     static_mean,static_std = model['static_mean'],model['static_std']
+    mfcc_mean,mfcc_std = model['mfcc_mean'],model['mfcc_std']
     threshold_murmur,threshold_outcome = model['threshold_murmur'],model['threshold_outcome']
 
     # apply filter on the input recording
@@ -602,6 +644,11 @@ def run_challenge_model(model, data, recordings, verbose):
     x_static = df_static[cols].fillna(value=0).values # size: 1 x 5
     x_static = np.tile(x_static, (x_test.shape[0],1))
 
+    # compute MFCC features
+    mfcc_test = get_mfcc_feature(x_test)
+    # apply normalization
+    mfcc_test = (mfcc_test-mfcc_mean)/mfcc_std
+
     n_test = x_test.shape[0]
     ytest_murmur_prob = []
     ytest_outcome_prob = []
@@ -613,12 +660,15 @@ def run_challenge_model(model, data, recordings, verbose):
             idx_batch = range(idx*batchSize, min((idx+1)*batchSize, n_test))
             x_in_batch = torch.from_numpy(x_test[idx_batch].reshape((\
                 len(idx_batch),1,x_test.shape[1]))).float()
+            mfcc_batch = torch.from_numpy(mfcc_test[idx_batch].reshape((\
+                len(idx_batch),1,mfcc_test.shape[1]))).float()
             x_static_batch = torch.from_numpy(x_static[idx_batch]).float()
             if flag_useCuda:
                 x_in_batch = x_in_batch.cuda()
+                mfcc_batch = mfcc_batch.cuda()
                 x_static_batch = x_static_batch.cuda()
             
-            outputs_murmur, outputs_outcome = clf.forward(x_in_batch, x_static_batch)
+            outputs_murmur, outputs_outcome = clf.forward(x_in_batch, mfcc_batch, x_static_batch)
 
             ytest_murmur_prob.append(outputs_murmur.detach().cpu().numpy())
             ytest_outcome_prob.append(outputs_outcome.detach().cpu().numpy())
