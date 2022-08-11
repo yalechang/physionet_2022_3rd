@@ -4,3 +4,4 @@ pandas==0.24.2
 tqdm==4.64.0
 torch==1.0.1
 scikit-learn==0.23.1
+python_speech_features==0.6
